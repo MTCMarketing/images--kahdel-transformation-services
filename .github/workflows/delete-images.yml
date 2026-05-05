@@ -1,0 +1,148 @@
+# @ppm-version:1.0
+
+name: Process Delete Queue (REAL)
+
+on:
+  push:
+    paths:
+      - "delete-queue/**"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: process-delete-${{ github.ref_name }}
+  cancel-in-progress: true
+
+jobs:
+  delete:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: true
+
+      - name: Apply changes (DELETE + UPDATE + RENAME)
+        run: |
+          node <<'EOF'
+          const fs = require('fs');
+          const path = require('path');
+          const { execSync } = require('child_process');
+
+          const queueDir = path.join(process.cwd(), 'delete-queue');
+          const imagesDir = path.join(process.cwd(), 'images');
+          const filesJsonPath = path.join(imagesDir, 'files.json');
+
+          const repo = process.env.GITHUB_REPOSITORY.split('/')[1];
+          const owner = process.env.GITHUB_REPOSITORY.split('/')[0];
+          const baseUrl = `https://${owner.toLowerCase()}.github.io/${repo}`;
+
+          if (!fs.existsSync(queueDir)) process.exit(0);
+          if (!fs.existsSync(filesJsonPath)) process.exit(1);
+
+          const data = JSON.parse(fs.readFileSync(filesJsonPath, 'utf-8'));
+
+          const queueFiles = fs.readdirSync(queueDir)
+            .filter(f => f.startsWith('batch-') && f.endsWith('.json'));
+
+          let logLines = [];
+
+          queueFiles.forEach(file => {
+            const payload = JSON.parse(fs.readFileSync(path.join(queueDir, file), 'utf-8'));
+
+            if (!Array.isArray(payload.changes)) return;
+
+            payload.changes.forEach(change => {
+
+              const id = String(change.id || "");
+
+              const entryKey = Object.keys(data).find(k => {
+                const name = data[k]?.name || "";
+                return k === id || name.startsWith(id);
+              });
+
+              if (!entryKey) {
+                logLines.push(`No match for ID: ${id}`);
+                return;
+              }
+
+              const entry = data[entryKey];
+              const oldName = entry.name;
+              const oldPath = path.join(imagesDir, oldName);
+
+              // =====================
+              // DELETE
+              // =====================
+              if (change.action === 'delete') {
+                logLines.push(`Deleting: ${oldName}`);
+
+                if (fs.existsSync(oldPath)) {
+                  fs.unlinkSync(oldPath);
+                }
+
+                delete data[entryKey];
+              }
+
+              // =====================
+              // UPDATE
+              // =====================
+              else if (change.action === 'update' && change.attribute) {
+                logLines.push(`Updating: ${oldName} → ${change.attribute}`);
+                data[entryKey][change.attribute] = change.value;
+              }
+
+              // =====================
+              // RENAME
+              // =====================
+              else if (change.action === 'rename' && change.value) {
+                const newName = change.value;
+                const newPath = path.join(imagesDir, newName);
+
+                logLines.push(`Renaming: ${oldName} → ${newName}`);
+
+                if (fs.existsSync(oldPath)) {
+                  execSync(`git mv "${oldPath}" "${newPath}"`);
+                } else {
+                  logLines.push(`⚠️ File missing: ${oldName}`);
+                }
+
+                data[entryKey].name = newName;
+                data[entryKey].path = `${baseUrl}/images/${newName}`;
+              }
+
+              else {
+                logLines.push(`Skipping invalid change: ${JSON.stringify(change)}`);
+              }
+
+            });
+
+            // 🔥 REMOVE PROCESSED BATCH FILE
+            fs.unlinkSync(path.join(queueDir, file));
+          });
+
+          // SAVE UPDATED JSON
+          fs.writeFileSync(filesJsonPath, JSON.stringify(data, null, 2));
+
+          // WRITE LOG
+          fs.writeFileSync(
+            path.join(queueDir, '_last-run-log.txt'),
+            logLines.join('\n') || 'No changes'
+          );
+
+          EOF
+
+      - name: Commit changes
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add images delete-queue || true
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Apply delete/update/rename changes"
+            git push origin HEAD:${{ github.ref_name }}
+          fi
