@@ -1,0 +1,316 @@
+# @ppm-version:1.0
+
+# .github/workflows/uploaded-images.yml
+name: Process Uploaded Images
+
+on:
+  push:
+    paths:
+      - "originals/**"
+      - "upload-queue/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: process-images-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  process:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          fetch-depth: 0
+          persist-credentials: true
+
+      - name: Pull latest branch before processing
+        run: |
+          git fetch origin ${{ github.ref_name }}
+          git reset --hard origin/${{ github.ref_name }}
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Install sharp
+        run: |
+          npm init -y
+          npm install sharp
+
+      - name: Read upload queue
+        id: upload_queue
+        run: |
+          node <<'EOF'
+          const fs = require("fs");
+          const path = require("path");
+
+          const root = process.cwd();
+          const queueDir = path.join(root, "upload-queue");
+
+          if (!fs.existsSync(queueDir)) {
+            console.log("No upload-queue folder found.");
+            fs.writeFileSync("upload-files.txt", "");
+            fs.writeFileSync("upload-queue-files.txt", "");
+            process.exit(0);
+          }
+
+          const queueFiles = fs
+            .readdirSync(queueDir)
+            .filter(file => file.startsWith("batch-") && file.endsWith(".json"))
+            .sort();
+
+          const sources = [];
+          const processableQueueFiles = [];
+
+          for (const queueFile of queueFiles) {
+            const queuePath = path.join(queueDir, queueFile);
+            const relativeQueuePath = path.posix.join("upload-queue", queueFile);
+
+            let payload;
+
+            try {
+              payload = JSON.parse(fs.readFileSync(queuePath, "utf8"));
+            } catch (err) {
+              console.log(`Invalid JSON, leaving queue file in place: ${relativeQueuePath}`);
+              console.log(err.message);
+              continue;
+            }
+
+            if (!payload || !Array.isArray(payload.uploads)) {
+              console.log(`Invalid queue shape, leaving queue file in place: ${relativeQueuePath}`);
+              continue;
+            }
+
+            let validQueueFile = true;
+
+            for (const upload of payload.uploads) {
+              const source = String(upload.source || "").trim();
+
+              if (!source.startsWith("originals/")) {
+                console.log(`Invalid source in ${relativeQueuePath}: ${source}`);
+                validQueueFile = false;
+                continue;
+              }
+
+              if (!/\.(png|jpe?g|webp)$/i.test(source)) {
+                console.log(`Unsupported file type in ${relativeQueuePath}: ${source}`);
+                validQueueFile = false;
+                continue;
+              }
+
+              const absoluteSource = path.join(root, source);
+
+              if (!fs.existsSync(absoluteSource)) {
+                console.log(`Missing source file in ${relativeQueuePath}: ${source}`);
+                validQueueFile = false;
+                continue;
+              }
+
+              sources.push(source);
+            }
+
+            if (validQueueFile) {
+              processableQueueFiles.push(relativeQueuePath);
+            }
+          }
+
+          const uniqueSources = [...new Set(sources)];
+
+          fs.writeFileSync("upload-files.txt", uniqueSources.join("\n"));
+          fs.writeFileSync("upload-queue-files.txt", processableQueueFiles.join("\n"));
+
+          console.log("Queue files found:", queueFiles.length);
+          console.log("Processable queue files:", processableQueueFiles.length);
+          console.log("Upload sources found:", uniqueSources.length);
+          console.log(uniqueSources.join("\n") || "No valid upload sources.");
+          EOF
+
+          FILES=$(cat upload-files.txt | tr '\n' ' ')
+          QUEUE_FILES=$(cat upload-queue-files.txt | tr '\n' ' ')
+
+          echo "FILES=$FILES" >> $GITHUB_OUTPUT
+          echo "QUEUE_FILES=$QUEUE_FILES" >> $GITHUB_OUTPUT
+
+      - name: Skip if no queued uploads
+        if: steps.upload_queue.outputs.FILES == ''
+        run: echo "No queued uploads found. Skipping."
+
+      - name: Convert queued images
+        if: steps.upload_queue.outputs.FILES != ''
+        run: |
+          node process-images.js ${{ steps.upload_queue.outputs.FILES }}
+
+      - name: Update files.json
+        if: steps.upload_queue.outputs.FILES != ''
+        run: |
+          node <<'EOF'
+          const fs = require("fs");
+          const path = require("path");
+          const https = require("https");
+
+          const root = process.cwd();
+          const imagesDir = path.join(root, "images");
+          const filePath = path.join(imagesDir, "files.json");
+
+          if (!fs.existsSync(imagesDir)) {
+            fs.mkdirSync(imagesDir, { recursive: true });
+          }
+
+          const [owner, repo] = process.env.GITHUB_REPOSITORY.split("/");
+          const baseUrl = `https://${owner.toLowerCase()}.github.io/${repo}`;
+          const remoteFilesJsonUrl = `${baseUrl}/images/files.json?v=${Date.now()}`;
+
+          function fetchRemoteJson(url) {
+            return new Promise((resolve) => {
+              https
+                .get(url, (res) => {
+                  if (res.statusCode !== 200) {
+                    res.resume();
+                    resolve(null);
+                    return;
+                  }
+
+                  let raw = "";
+                  res.setEncoding("utf8");
+
+                  res.on("data", chunk => {
+                    raw += chunk;
+                  });
+
+                  res.on("end", () => {
+                    try {
+                      resolve(JSON.parse(raw));
+                    } catch {
+                      resolve(null);
+                    }
+                  });
+                })
+                .on("error", () => resolve(null));
+            });
+          }
+
+          function readLocalJson(file) {
+            if (!fs.existsSync(file)) return {};
+            try {
+              const parsed = JSON.parse(fs.readFileSync(file, "utf8"));
+              if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+                return parsed;
+              }
+            } catch {}
+            return {};
+          }
+
+          (async () => {
+            const localData = readLocalJson(filePath);
+            const remoteData = await fetchRemoteJson(remoteFilesJsonUrl);
+
+            let data = {};
+
+            if (
+              remoteData &&
+              typeof remoteData === "object" &&
+              !Array.isArray(remoteData)
+            ) {
+              data = { ...remoteData };
+              console.log(`Loaded existing remote files.json with ${Object.keys(remoteData).length} records.`);
+            } else {
+              console.log("No readable remote files.json found. Using local files.json only.");
+            }
+
+            data = {
+              ...data,
+              ...localData
+            };
+
+            const existingNames = new Set(
+              Object.values(data)
+                .map(entry => entry && entry.name)
+                .filter(Boolean)
+            );
+
+            const existingPaths = new Set(
+              Object.values(data)
+                .map(entry => entry && entry.path)
+                .filter(Boolean)
+            );
+
+            const webpFiles = fs
+              .readdirSync(imagesDir)
+              .filter(file => file.endsWith(".webp"))
+              .sort();
+
+            let added = 0;
+            let now = Date.now();
+
+            for (const file of webpFiles) {
+              const imagePath = `${baseUrl}/images/${file}`;
+
+              if (existingNames.has(file) || existingPaths.has(imagePath)) {
+                continue;
+              }
+
+              let key = String(now + added);
+
+              while (data[key]) {
+                now++;
+                key = String(now + added);
+              }
+
+              data[key] = {
+                path: imagePath,
+                name: file,
+                meta: {}
+              };
+
+              existingNames.add(file);
+              existingPaths.add(imagePath);
+              added++;
+            }
+
+            fs.writeFileSync(filePath, JSON.stringify(data, null, 2));
+
+            console.log(`files.json updated.`);
+            console.log(`Total records now: ${Object.keys(data).length}`);
+            console.log(`New records added: ${added}`);
+          })().catch(err => {
+            console.error(err);
+            process.exit(1);
+          });
+          EOF
+
+      - name: Remove processed upload queue files
+        if: steps.upload_queue.outputs.FILES != ''
+        run: |
+          for file in ${{ steps.upload_queue.outputs.QUEUE_FILES }}
+          do
+            if [ -f "$file" ]; then
+              echo "Removing processed queue file: $file"
+              git rm "$file"
+            fi
+          done
+
+      - name: Commit processed images + metadata + queue cleanup
+        if: steps.upload_queue.outputs.FILES != ''
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add images upload-queue
+
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Process uploaded images"
+
+            git fetch origin ${{ github.ref_name }}
+            git pull --rebase origin ${{ github.ref_name }}
+
+            git push origin HEAD:${{ github.ref_name }}
+          fi
